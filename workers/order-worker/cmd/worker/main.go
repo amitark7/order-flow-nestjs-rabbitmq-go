@@ -188,7 +188,7 @@ func main() {
 
 		completedEvent := map[string]interface{}{
 			"eventId":    event.EventId,
-			"eventType":  event.EventType,
+			"eventType":  "order.completed",
 			"version":    event.Version,
 			"occurredAt": time.Now().UTC().Format(time.RFC3339Nano),
 			"data": map[string]interface{}{
