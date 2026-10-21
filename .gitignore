@@ -1,0 +1,5 @@
+# Ignore generated directories at any level
+dist/
+node_modules/
+build/
+coverage/
