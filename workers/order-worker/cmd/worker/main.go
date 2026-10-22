@@ -10,7 +10,6 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/segmentio/kafka-go"
 )
 
 type OrderMessage struct {
@@ -49,23 +48,6 @@ func main() {
 
 	log.Printf("Connected to PostgreSQL")
 
-	kafkaBroker := os.Getenv("KAFKA_BROKER")
-
-	kafkaWriter := &kafka.Writer{
-		Addr:         kafka.TCP(kafkaBroker),
-		Topic:        "order.completed",
-		Balancer:     &kafka.LeastBytes{},
-		RequiredAcks: kafka.RequireAll,
-	}
-
-	defer kafkaWriter.Close()
-
-	log.Println("Kafka producer configured")
-
-	if kafkaBroker == "" {
-		kafkaBroker = "localhost:9092"
-	}
-
 	conn, err := amqp.Dial(rabbitMqUrl)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
@@ -79,7 +61,7 @@ func main() {
 		log.Fatalf("Failed to open RabbitMQ channel: %v", err)
 	}
 
-	defer conn.Close()
+	defer ch.Close()
 
 	if err := ch.Qos(1, 0, false); err != nil {
 		log.Fatalf("Failed to configure consumer QoS: %v", err)
@@ -112,24 +94,37 @@ func main() {
 			continue
 		}
 
-		if event.Data.ID == "" {
-			log.Println("Missing Order ID; rejecting message")
+		if event.EventType != "order.process" || event.Data.ID == "" || event.Data.CustomerEmail == "" || event.Data.Amount < 0 {
+			log.Printf("Invalid order.process event; rejecting message")
 
 			if err := msg.Nack(false, false); err != nil {
-				log.Printf("Failed to reject message %v", err)
+				log.Printf("Failed to reject message: %v", err)
 			}
 			continue
 		}
 
-		result, err := db.Exec(
+		tx, err := db.BeginTx(context.Background(), nil)
+
+		if err != nil {
+			log.Printf("Failed to begin transaction %v", err)
+
+			if err := msg.Nack(false, true); err != nil {
+				log.Printf("Failed to requeue message: %v", err)
+			}
+			continue
+		}
+
+		result, err := tx.ExecContext(
+			context.Background(),
 			`UPDATE orders
-			 SET status = 'PROCESSING', "updatedAt" = NOW()
+			 SET status = 'COMPLETED', "updatedAt" = NOW()
 			 WHERE id = $1 AND status = 'PENDING'`,
 			event.Data.ID,
 		)
 
 		if err != nil {
-			log.Printf("Database update failed for order %s :%v ", event.Data.ID, err)
+			_ = tx.Rollback()
+			log.Printf("Failed to update order %s: %v", event.Data.ID, err)
 			if err := msg.Nack(false, true); err != nil {
 				log.Printf("Failed to requeue message: %v", err)
 			}
@@ -139,7 +134,8 @@ func main() {
 		rows, err := result.RowsAffected()
 
 		if err != nil {
-			log.Printf("Could not checked update result")
+			_ = tx.Rollback()
+			log.Printf("Failed to check update result: %v", err)
 			if err := msg.Nack(false, true); err != nil {
 				log.Printf("Failed to requeue message : %v", err)
 			}
@@ -147,7 +143,11 @@ func main() {
 		}
 
 		if rows == 0 {
-			log.Printf("Order %s not updated: missing order or not pending", event.Data.ID)
+			_ = tx.Rollback()
+			log.Printf(
+				"Order %s is missing or no longer PENDING; acknowledging duplicate",
+				event.Data.ID,
+			)
 
 			if err := msg.Ack(false); err != nil {
 				log.Printf("Failed to acknowledge message: %v", err)
@@ -155,31 +155,14 @@ func main() {
 			continue
 		}
 
-		if err := msg.Ack(false); err != nil {
-			log.Printf("Failed to acknownledge order %s : %v", event.Data.ID, err)
-			continue
-		}
-
-		result, err = db.Exec(
-			`
-			UPDATE orders
-			SET status = 'COMPLETED', "updatedAt" = NOW()
-			WHERE id = $1 AND status = 'PROCESSING'`,
-			event.Data.ID,
-		)
+		var outboxID string
+		err = tx.QueryRowContext(
+			context.Background(),
+			`SELECT gen_random_uuid()::text`).Scan(&outboxID)
 
 		if err != nil {
-			log.Printf("Failed to complete order %s: %v", event.Data.ID, err)
-
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message : %v", err)
-			}
-			continue
-		}
-
-		rows, err = result.RowsAffected()
-		if err != nil || rows == 0 {
-			log.Printf("Order %s could not be marked COMPLETED", event.Data.ID)
+			_ = tx.Rollback()
+			log.Printf("Failed to generate outbox event ID: %v", err)
 			if err := msg.Nack(false, true); err != nil {
 				log.Printf("Failed to requeue message: %v", err)
 			}
@@ -187,9 +170,9 @@ func main() {
 		}
 
 		completedEvent := map[string]interface{}{
-			"eventId":    event.EventId,
+			"eventId":    outboxID,
 			"eventType":  "order.completed",
-			"version":    event.Version,
+			"version":    1,
 			"occurredAt": time.Now().UTC().Format(time.RFC3339Nano),
 			"data": map[string]interface{}{
 				"id":            event.Data.ID,
@@ -201,6 +184,7 @@ func main() {
 
 		payload, err := json.Marshal(completedEvent)
 		if err != nil {
+			_ = tx.Rollback()
 			log.Printf("Failed to encode completion event: %v", err)
 			if err := msg.Nack(false, true); err != nil {
 				log.Printf("Failed to requeue message: %v", err)
@@ -208,29 +192,43 @@ func main() {
 			continue
 		}
 
-		err = kafkaWriter.WriteMessages(
+		_, err = tx.ExecContext(
 			context.Background(),
-			kafka.Message{
-				Key:   []byte(event.Data.ID),
-				Value: payload,
-				Time:  time.Now().UTC(),
-			},
+			`INSERT INTO outbox_events
+			 (id, aggregate_id, event_type, payload)
+			 VALUES ($1, $2, $3, $4::jsonb)`,
+			outboxID,
+			event.Data.ID,
+			"order.completed",
+			string(payload),
 		)
-
 		if err != nil {
-			log.Printf("Kafka publish Failed for order %s: %v", event.Data.ID, err)
+			_ = tx.Rollback()
+			log.Printf("Failed to insert outbox event for order %s: %v", event.Data.ID, err)
 			if err := msg.Nack(false, true); err != nil {
 				log.Printf("Failed to requeue message: %v", err)
 			}
 			continue
 		}
 
+		if err := tx.Commit(); err != nil {
+			log.Printf("Transaction commit failed for order %s: %v", event.Data.ID, err)
+			if nackErr := msg.Nack(false, true); nackErr != nil {
+				log.Printf("Failed to requeue message: %v", nackErr)
+			}
+			continue
+		}
+
+		// Acknowledge only after both database changes are committed.
 		if err := msg.Ack(false); err != nil {
 			log.Printf("Failed to acknowledge order %s: %v", event.Data.ID, err)
 			continue
 		}
 
-		log.Printf("Order %s COMPLETED; event published to Kafka", event.Data.ID)
+		log.Printf(
+			"Order %s COMPLETED; outbox event %s saved",
+			event.Data.ID,
+			outboxID,
+		)
 	}
-
 }
