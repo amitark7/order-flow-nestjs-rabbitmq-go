@@ -132,9 +132,24 @@ func publishPending(
 		)
 		if err != nil {
 			log.Printf("Kafka publish failed for outbox event %s: %v", event.ID, err)
+
+			_, updateErr := db.ExecContext(
+				ctx,
+				`UPDATE outbox_events
+				SET attempts = attempts + 1
+				WHERE id = $1 AND published_at IS NULL`,
+				event.ID,
+			)
+			if updateErr != nil {
+				log.Printf(
+					"Failed to increment attempts for outbox event %s: %v",
+					event.ID,
+					updateErr,
+				)
+			}
+
 			continue
 		}
-
 		result, err := db.ExecContext(
 			ctx,
 			`UPDATE outbox_events

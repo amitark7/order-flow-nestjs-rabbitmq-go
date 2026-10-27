@@ -4,26 +4,53 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
-	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+type OrderData struct {
+	ID            string `json:"id"`
+	CustomerEmail string `json:"customerEmail"`
+	Amount        int    `json:"amount"`
+}
+
 type OrderMessage struct {
-	EventId   string `json:"eventId"`
-	EventType string `json:"eventType"`
-	Version   int    `json:"version"`
-	Data      struct {
-		ID            string `json:"id"`
-		CustomerEmail string `json:"customerEmail"`
-		Amount        int    `json:"amount"`
-	} `json:"data"`
+	EventId   string    `json:"eventId"`
+	EventType string    `json:"eventType"`
+	Version   int       `json:"version"`
+	Data      OrderData `json:"data"`
+}
+
+type OrderProcessResult string
+
+const (
+	OrderCompleted OrderProcessResult = "completed"
+	OrderDuplicate OrderProcessResult = "duplicate"
+)
+
+type OrderProcessOutcome struct {
+	Result OrderProcessResult
+	Err    error
+}
+
+func validateOrderMessage(event OrderMessage) bool {
+	return event.EventId != "" &&
+		event.EventType == "order.process" &&
+		event.Version == 1 &&
+		event.Data.ID != "" &&
+		event.Data.CustomerEmail != "" &&
+		event.Data.Amount > 0
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	rabbitMqUrl := os.Getenv("RABBITMQ_URL")
 	if rabbitMqUrl == "" {
 		rabbitMqUrl = "amqp://orderflow:local_dev_password@localhost:5672/"
@@ -38,19 +65,22 @@ func main() {
 	db, err := sql.Open("pgx", databaseUrl)
 
 	if err != nil {
-		log.Fatalf("Failed to configure PostgreSQL: %v", err)
+		slog.Error("Failed to configure PostgreSQL", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+		slog.Error("Failed to connect to PostgreSQL", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Connected to PostgreSQL")
+	slog.Info("Connected to PostgreSQL")
 
 	conn, err := amqp.Dial(rabbitMqUrl)
 	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		slog.Error("Failed to connect to RabbitMQ", "error", err)
+		os.Exit(1)
 	}
 
 	defer conn.Close()
@@ -58,13 +88,15 @@ func main() {
 	ch, err := conn.Channel()
 
 	if err != nil {
-		log.Fatalf("Failed to open RabbitMQ channel: %v", err)
+		slog.Error("Failed to open RabbitMQ channel", "error", err)
+		os.Exit(1)
 	}
 
 	defer ch.Close()
 
 	if err := ch.Qos(1, 0, false); err != nil {
-		log.Fatalf("Failed to configure consumer QoS: %v", err)
+		slog.Error("Failed to configure consumer QoS", "error", err)
+		os.Exit(1)
 	}
 
 	msgs, err := ch.Consume(
@@ -78,157 +110,97 @@ func main() {
 	)
 
 	if err != nil {
-		log.Fatalf("Failed to register consumer: %v", err)
+		slog.Error("Failed to register consumer", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Go Order Worker waiting for messages...")
+	slog.Info("Go Order Worker waiting for messages")
 
 	for msg := range msgs {
+		correlationID := msg.CorrelationId
 		var event OrderMessage
 
 		if err := json.Unmarshal(msg.Body, &event); err != nil {
-			log.Printf("Invalid JSON; rejecting message: %v", err)
+			slog.Error(
+				"Invalid JSON; rejecting message",
+				"correlation_id", correlationID,
+				"error", err,
+			)
 			if err := msg.Nack(false, false); err != nil {
-				log.Printf("Failed to reject message %v", err)
+				slog.Error("Failed to reject message", "error", err)
 			}
 			continue
 		}
 
-		if event.EventType != "order.process" || event.Data.ID == "" || event.Data.CustomerEmail == "" || event.Data.Amount < 0 {
-			log.Printf("Invalid order.process event; rejecting message")
+		if !validateOrderMessage(event) {
+			slog.Error(
+				"Invalid order.process event; rejecting message",
+				"correlation_id", correlationID,
+				"order_id", event.Data.ID,
+				"event_type", event.EventType,
+			)
 
 			if err := msg.Nack(false, false); err != nil {
-				log.Printf("Failed to reject message: %v", err)
+				slog.Error("Failed to reject invalid event", "error", err)
 			}
 			continue
 		}
 
-		tx, err := db.BeginTx(context.Background(), nil)
-
-		if err != nil {
-			log.Printf("Failed to begin transaction %v", err)
-
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message: %v", err)
-			}
-			continue
-		}
-
-		result, err := tx.ExecContext(
+		outcome := processOrder(
 			context.Background(),
-			`UPDATE orders
-			 SET status = 'COMPLETED', "updatedAt" = NOW()
-			 WHERE id = $1 AND status = 'PENDING'`,
-			event.Data.ID,
+			db,
+			event,
+			correlationID,
 		)
 
-		if err != nil {
-			_ = tx.Rollback()
-			log.Printf("Failed to update order %s: %v", event.Data.ID, err)
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message: %v", err)
+		if outcome.Err != nil {
+			slog.Error(
+				"Failed to process order; requeueing message",
+				"correlation_id", correlationID,
+				"order_id", event.Data.ID,
+				"error", outcome.Err,
+			)
+
+			if nackErr := msg.Nack(false, true); nackErr != nil {
+				slog.Error(
+					"Failed to requeue message",
+					"order_id", event.Data.ID,
+					"error", nackErr,
+				)
 			}
 			continue
 		}
 
-		rows, err := result.RowsAffected()
-
-		if err != nil {
-			_ = tx.Rollback()
-			log.Printf("Failed to check update result: %v", err)
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message : %v", err)
-			}
-			continue
-		}
-
-		if rows == 0 {
-			_ = tx.Rollback()
-			log.Printf(
-				"Order %s is missing or no longer PENDING; acknowledging duplicate",
-				event.Data.ID,
+		if outcome.Result == OrderDuplicate {
+			slog.Info(
+				"Order is missing or no longer PENDING; acknowledging duplicate",
+				"order_id", event.Data.ID,
 			)
 
 			if err := msg.Ack(false); err != nil {
-				log.Printf("Failed to acknowledge message: %v", err)
+				slog.Error(
+					"Failed to acknowledge message",
+					"order_id", event.Data.ID,
+					"error", err,
+				)
 			}
 			continue
 		}
 
-		var outboxID string
-		err = tx.QueryRowContext(
-			context.Background(),
-			`SELECT gen_random_uuid()::text`).Scan(&outboxID)
-
-		if err != nil {
-			_ = tx.Rollback()
-			log.Printf("Failed to generate outbox event ID: %v", err)
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message: %v", err)
-			}
-			continue
-		}
-
-		completedEvent := map[string]interface{}{
-			"eventId":    outboxID,
-			"eventType":  "order.completed",
-			"version":    1,
-			"occurredAt": time.Now().UTC().Format(time.RFC3339Nano),
-			"data": map[string]interface{}{
-				"id":            event.Data.ID,
-				"customerEmail": event.Data.CustomerEmail,
-				"amount":        event.Data.Amount,
-				"status":        "COMPLETED",
-			},
-		}
-
-		payload, err := json.Marshal(completedEvent)
-		if err != nil {
-			_ = tx.Rollback()
-			log.Printf("Failed to encode completion event: %v", err)
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message: %v", err)
-			}
-			continue
-		}
-
-		_, err = tx.ExecContext(
-			context.Background(),
-			`INSERT INTO outbox_events
-			 (id, aggregate_id, event_type, payload)
-			 VALUES ($1, $2, $3, $4::jsonb)`,
-			outboxID,
-			event.Data.ID,
-			"order.completed",
-			string(payload),
-		)
-		if err != nil {
-			_ = tx.Rollback()
-			log.Printf("Failed to insert outbox event for order %s: %v", event.Data.ID, err)
-			if err := msg.Nack(false, true); err != nil {
-				log.Printf("Failed to requeue message: %v", err)
-			}
-			continue
-		}
-
-		if err := tx.Commit(); err != nil {
-			log.Printf("Transaction commit failed for order %s: %v", event.Data.ID, err)
-			if nackErr := msg.Nack(false, true); nackErr != nil {
-				log.Printf("Failed to requeue message: %v", nackErr)
-			}
-			continue
-		}
-
-		// Acknowledge only after both database changes are committed.
 		if err := msg.Ack(false); err != nil {
-			log.Printf("Failed to acknowledge order %s: %v", event.Data.ID, err)
+			slog.Error(
+				"Failed to acknowledge completed order",
+				"order_id", event.Data.ID,
+				"error", err,
+			)
 			continue
 		}
 
-		log.Printf(
-			"Order %s COMPLETED; outbox event %s saved",
-			event.Data.ID,
-			outboxID,
+		slog.Info(
+			"Order COMPLETED; outbox event saved",
+			"correlation_id", correlationID,
+			"order_id", event.Data.ID,
+			"status", "COMPLETED",
 		)
 	}
 }

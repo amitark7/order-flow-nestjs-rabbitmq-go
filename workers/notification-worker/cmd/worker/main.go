@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,11 +17,12 @@ import (
 )
 
 type OrderCompletedEvent struct {
-	EventID    string `json:"eventId"`
-	EventType  string `json:"eventType"`
-	Version    int    `json:"version"`
-	OccurredAt string `json:"occurredAt"`
-	Data       struct {
+	EventID       string `json:"eventId"`
+	EventType     string `json:"eventType"`
+	Version       int    `json:"version"`
+	OccurredAt    string `json:"occurredAt"`
+	CorrelationID string `json:"correlationId"`
+	Data          struct {
 		ID            string `json:"id"`
 		CustomerEmail string `json:"customerEmail"`
 		Amount        int    `json:"amount"`
@@ -32,6 +34,7 @@ type NotificationJob struct {
 	ID            string
 	EventID       string
 	OrderID       string
+	CorrelationID string
 	CustomerEmail string
 	Amount        int
 	Attempts      int
@@ -50,7 +53,7 @@ func claimNotificationJob(
 	job := &NotificationJob{}
 
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, event_id, order_id, customer_email, amount, attempts
+		SELECT id, event_id, correlation_id, order_id, customer_email, amount, attempts
 		FROM notifications
 		WHERE (
 			(
@@ -73,6 +76,7 @@ func claimNotificationJob(
 	`).Scan(
 		&job.ID,
 		&job.EventID,
+		&job.CorrelationID,
 		&job.OrderID,
 		&job.CustomerEmail,
 		&job.Amount,
@@ -102,7 +106,47 @@ func claimNotificationJob(
 	return job, nil
 }
 
+func saveNotificationJob(
+	ctx context.Context,
+	db *sql.DB,
+	event OrderCompletedEvent,
+) (bool, error) {
+	result, err := db.ExecContext(ctx, `
+		INSERT INTO notifications (
+			event_id,
+			correlation_id,
+			order_id,
+			customer_email,
+			amount,
+			status
+		)
+		VALUES ($1, $2, $3, $4, $5, 'PENDING')
+		ON CONFLICT (event_id) DO NOTHING
+	`,
+		event.EventID,
+		event.CorrelationID,
+		event.Data.ID,
+		event.Data.CustomerEmail,
+		event.Data.Amount,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return inserted == 1, nil
+}
+
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	broker := os.Getenv("KAFKA_BROKER")
 	if broker == "" {
 		broker = "localhost:9092"
@@ -115,14 +159,16 @@ func main() {
 
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		log.Fatalf("Failed to configure PostgreSQL: %v", err)
+		slog.Error("Failed to configure PostgreSQL", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+		slog.Error("Failed to connect to PostgreSQL", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Notification Worker connected to PostgreSQL")
+	slog.Info("Notification Worker connected to PostgreSQL")
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -140,10 +186,18 @@ func main() {
 	})
 	defer reader.Close()
 
-	log.Printf("Notification Worker listening on Kafka topic order.completed at %s", broker)
+	slog.Info(
+		"Notification Worker listening on Kafka topic",
+		"topic", "order.completed",
+		"broker", broker,
+	)
 
+	var processorWG sync.WaitGroup
+	processorWG.Add(1)
 	// Process pending notification jobs every 2 seconds.
 	go func() {
+		defer processorWG.Done()
+
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
@@ -152,7 +206,7 @@ func main() {
 
 			select {
 			case <-ctx.Done():
-				log.Println("Notification processor shutting down")
+				slog.Info("Notification processor shutting down")
 				return
 			case <-ticker.C:
 			}
@@ -163,19 +217,28 @@ func main() {
 		message, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				log.Println("Shutdown signal received")
-				return
+				slog.Info("Shutdown signal received")
+				break
 			}
-			log.Printf("Failed to fetch Kafka message: %v", err)
+			slog.Error("Failed to fetch Kafka message", "error", err)
 			continue
 		}
 
 		var event OrderCompletedEvent
 		if err := json.Unmarshal(message.Value, &event); err != nil {
-			log.Printf("Invalid event JSON at partition %d offset %d: %v",
-				message.Partition, message.Offset, err)
+			slog.Error(
+				"Invalid event JSON",
+				"partition", message.Partition,
+				"offset", message.Offset,
+				"error", err,
+			)
 			if err := reader.CommitMessages(ctx, message); err != nil {
-				log.Printf("Failed to commit malformed message: %v", err)
+				slog.Error(
+					"Failed to commit malformed Kafka message",
+					"partition", message.Partition,
+					"offset", message.Offset,
+					"error", err,
+				)
 			}
 			continue
 		}
@@ -184,53 +247,79 @@ func main() {
 			event.EventType != "order.completed" ||
 			event.Data.ID == "" ||
 			event.Data.CustomerEmail == "" {
-			log.Printf("Invalid order.completed event at partition %d offset %d",
-				message.Partition, message.Offset)
+			slog.Error(
+				"Invalid order.completed event",
+				"partition", message.Partition,
+				"offset", message.Offset,
+				"correlation_id", event.CorrelationID,
+			)
 			if err := reader.CommitMessages(ctx, message); err != nil {
-				log.Printf("Failed to commit invalid event: %v", err)
+				slog.Error(
+					"Failed to commit invalid Kafka event",
+					"partition", message.Partition,
+					"offset", message.Offset,
+					"error", err,
+				)
 			}
 			continue
 		}
 
 		// Atomically claim this event ID. The primary key prevents duplicates.
-		result, err := db.ExecContext(ctx, `
-			INSERT INTO notifications (
-				event_id,
-				order_id,
-				customer_email,
-				amount,
-				status
+		inserted, err := saveNotificationJob(ctx, db, event)
+		if err != nil {
+			slog.Error(
+				"Failed to save notification job",
+				"event_id", event.EventID,
+				"correlation_id", event.CorrelationID,
+				"error", err,
 			)
-			VALUES ($1, $2, $3, $4, 'PENDING')
-			ON CONFLICT (event_id) DO NOTHING
-		`,
-			event.EventID,
-			event.Data.ID,
-			event.Data.CustomerEmail,
-			event.Data.Amount,
-		)
-		if err != nil {
-			log.Printf("Failed to save notification job for event %s: %v", event.EventID, err)
 			continue
 		}
 
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			log.Printf("Failed to inspect notification insert result: %v", err)
-			continue
-		}
-
-		if inserted == 0 {
-			log.Printf("Duplicate event %s; notification job already exists", event.EventID)
+		if !inserted {
+			slog.Info(
+				"Duplicate event; notification job already exists",
+				"event_id", event.EventID,
+				"correlation_id", event.CorrelationID,
+			)
 		} else {
-			log.Printf("Notification job created for order %s; status=PENDING", event.Data.ID)
+			slog.Info(
+				"Notification job created",
+				"event_id", event.EventID,
+				"correlation_id", event.CorrelationID,
+				"order_id", event.Data.ID,
+				"customer_email", event.Data.CustomerEmail,
+				"status", "PENDING",
+			)
 		}
 
 		if err := reader.CommitMessages(ctx, message); err != nil {
-			log.Printf("Failed to commit Kafka message: %v", err)
+			slog.Error(
+				"Failed to commit Kafka message",
+				"partition", message.Partition,
+				"offset", message.Offset,
+				"error", err,
+			)
 			continue
 		}
 	}
+
+	// Cancel the shared context so the processor exits.
+	stop()
+
+	// Close Kafka reader to release any remaining resources.
+	if err := reader.Close(); err != nil {
+		slog.Error("Failed to close Kafka reader", "error", err)
+	}
+
+	// Wait for the processor before closing PostgreSQL.
+	processorWG.Wait()
+
+	if err := db.Close(); err != nil {
+		slog.Error("Failed to close PostgreSQL connection", "error", err)
+	}
+
+	slog.Info("Notification Worker shut down cleanly")
 }
 
 func processPendingNotifications(ctx context.Context, db *sql.DB) {
@@ -246,7 +335,7 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 		AND attempts >= $1
 	`, maxAttempts)
 	if err != nil {
-		log.Printf("Failed to mark exhausted pending jobs: %v", err)
+		slog.Error("Failed to mark exhausted pending jobs", "error", err)
 		return
 	}
 
@@ -260,12 +349,15 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 		AND attempts >= $1
 	`, maxAttempts)
 	if err != nil {
-		log.Printf("Failed to mark exhausted notification jobs: %v", err)
+		slog.Error("Failed to mark exhausted notification jobs", "error", err)
 		return
 	}
 
 	if affected, _ := result.RowsAffected(); affected > 0 {
-		log.Printf("Marked %d stale notification job(s) as FAILED", affected)
+		slog.Info(
+			"Marked stale notification jobs as FAILED",
+			"count", affected,
+		)
 	}
 
 	for {
@@ -279,7 +371,7 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 		}
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Printf("Failed to claim notification job: %v", err)
+				slog.Error("Failed to claim notification job", "error", err)
 			}
 			return
 		}
@@ -289,11 +381,12 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 		if job.CustomerEmail == "test-fail@example.com" {
 			deliveryErr = errors.New("simulated notification delivery failure")
 		} else {
-			log.Printf(
-				"SIMULATED NOTIFICATION: Order %s completed for %s; amount=%d",
-				job.OrderID,
-				job.CustomerEmail,
-				job.Amount,
+			slog.Info(
+				"SIMULATED NOTIFICATION",
+				"correlation_id", job.CorrelationID,
+				"order_id", job.OrderID,
+				"customer_email", job.CustomerEmail,
+				"amount", job.Amount,
 			)
 		}
 
@@ -307,19 +400,37 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 				WHERE id = $1 AND status = 'PROCESSING'
 			`, job.ID)
 			if err != nil {
-				log.Printf("Failed to mark notification %s as SENT: %v", job.ID, err)
+				slog.Error(
+					"Failed to mark notification as SENT",
+					"notification_id", job.ID,
+					"order_id", job.OrderID,
+					"error", err,
+				)
 				return
 			}
 
 			if affected, _ := result.RowsAffected(); affected == 1 {
-				log.Printf("Notification job %s marked SENT", job.ID)
+				slog.Info(
+					"Notification job marked SENT",
+					"notification_id", job.ID,
+					"event_id", job.EventID,
+					"order_id", job.OrderID,
+					"customer_email", job.CustomerEmail,
+					"attempt", job.Attempts,
+					"status", "SENT",
+				)
 			}
 			continue
 		}
 
-		log.Printf(
-			"Delivery failed for job %s (attempt %d/%d): %v",
-			job.ID, job.Attempts, maxAttempts, deliveryErr,
+		slog.Error(
+			"Notification delivery failed",
+			"notification_id", job.ID,
+			"event_id", job.EventID,
+			"order_id", job.OrderID,
+			"customer_email", job.CustomerEmail,
+			"attempt", job.Attempts,
+			"error", deliveryErr.Error(),
 		)
 
 		nextStatus := "PENDING"
@@ -341,14 +452,36 @@ func processPendingNotifications(ctx context.Context, db *sql.DB) {
 		`, job.ID, nextStatus, deliveryErr.Error(), nextAttemptAt)
 
 		if err != nil {
-			log.Printf("Failed to update notification job %s after delivery failure: %v", job.ID, err)
+			slog.Error(
+				"Failed to update notification job after delivery failure",
+				"notification_id", job.ID,
+				"order_id", job.OrderID,
+				"error", err,
+			)
 			return
 		}
 
 		if nextStatus == "FAILED" {
-			log.Printf("Notification job %s exhausted retries; status=FAILED", job.ID)
+			slog.Error(
+				"Notification job exhausted retries",
+				"notification_id", job.ID,
+				"event_id", job.EventID,
+				"order_id", job.OrderID,
+				"customer_email", job.CustomerEmail,
+				"attempt", job.Attempts,
+				"status", nextStatus,
+				"error", deliveryErr.Error(),
+			)
 		} else {
-			log.Printf("Notification job %s scheduled for retry; status=PENDING", job.ID)
+			slog.Info(
+				"Notification job scheduled for retry",
+				"notification_id", job.ID,
+				"event_id", job.EventID,
+				"order_id", job.OrderID,
+				"attempt", job.Attempts,
+				"status", nextStatus,
+				"next_attempt_at", nextAttemptAt,
+			)
 			return // Avoid retrying immediately in a tight loop.
 		}
 	}
