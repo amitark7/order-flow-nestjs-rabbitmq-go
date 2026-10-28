@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -141,6 +143,57 @@ func saveNotificationJob(
 	return inserted == 1, nil
 }
 
+var ready atomic.Bool
+
+func startHealthServer(db *sql.DB, broker string) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("alive"))
+	})
+
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := db.PingContext(ctx); err != nil {
+			http.Error(w, "postgres unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		conn, err := kafka.DialContext(ctx, "tcp", broker)
+		if err != nil {
+			http.Error(w, "kafka unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = conn.Close()
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+
+	server := &http.Server{
+		Addr:              ":8081",
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Health server listening", "port", 8081)
+		if err := server.ListenAndServe(); err != nil &&
+			err != http.ErrServerClosed {
+			slog.Error("Health server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -191,6 +244,9 @@ func main() {
 		"topic", "order.completed",
 		"broker", broker,
 	)
+
+	ready.Store(true)
+	startHealthServer(db, broker)
 
 	var processorWG sync.WaitGroup
 	processorWG.Add(1)

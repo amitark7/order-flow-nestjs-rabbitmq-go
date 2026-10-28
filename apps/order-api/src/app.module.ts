@@ -13,11 +13,11 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
   imports: [
     TypeOrmModule.forRoot({
       type: 'postgres',
-      host: 'localhost',
-      port: 5432,
-      username: 'orderflow',
-      password: 'local_dev_password',
-      database: 'orderflow',
+      host: process.env.DB_HOST ?? 'localhost',
+      port: Number(process.env.DB_PORT ?? 5432),
+      username: process.env.DB_USERNAME ?? 'orderflow',
+      password: process.env.DB_PASSWORD ?? 'local_dev_password',
+      database: process.env.DB_DATABASE ?? 'orderflow',
       autoLoadEntities: true,
       synchronize: false,
     }),

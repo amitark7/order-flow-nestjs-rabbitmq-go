@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"os"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -34,6 +37,52 @@ const (
 type OrderProcessOutcome struct {
 	Result OrderProcessResult
 	Err    error
+}
+
+var ready atomic.Bool
+
+func startHealthServer(db *sql.DB, conn *amqp.Connection) {
+	mux := http.NewServeMux()
+
+	// Liveness: the process and HTTP server are responding.
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("alive"))
+	})
+
+	// Readiness: dependencies must be available before receiving traffic.
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() || conn.IsClosed() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := db.PingContext(ctx); err != nil {
+			http.Error(w, "postgres unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+
+	server := &http.Server{
+		Addr:              ":8081",
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Health server listening", "port", 8081)
+		if err := server.ListenAndServe(); err != nil &&
+			err != http.ErrServerClosed {
+			slog.Error("Health server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
 }
 
 func validateOrderMessage(event OrderMessage) bool {
@@ -113,6 +162,9 @@ func main() {
 		slog.Error("Failed to register consumer", "error", err)
 		os.Exit(1)
 	}
+
+	ready.Store(true)
+	startHealthServer(db, conn)
 
 	slog.Info("Go Order Worker waiting for messages")
 

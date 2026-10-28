@@ -3,3 +3,5 @@ dist/
 node_modules/
 build/
 coverage/
+# Local Kubernetes credentials
+k8s/secrets.yaml
