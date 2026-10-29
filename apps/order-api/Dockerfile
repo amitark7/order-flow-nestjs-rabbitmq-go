@@ -1,15 +1,24 @@
-FROM node:24-bookworm-slim AS build
+
+FROM node:22-alpine AS build
+
 WORKDIR /app
-COPY package*.json ./
+
+COPY apps/order-api/package*.json ./
 RUN npm ci
-COPY . .
+
+COPY apps/order-api/ ./
 RUN npm run build
 
-FROM node:24-bookworm-slim AS production
-ENV NODE_ENV=production
+FROM node:22-alpine AS production
+
 WORKDIR /app
+ENV NODE_ENV=production
+
 COPY --from=build /app/package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev
+
 COPY --from=build /app/dist ./dist
+
 EXPOSE 3000
-CMD ["node", "dist/main"]
+
+CMD ["node", "dist/main.js"]
