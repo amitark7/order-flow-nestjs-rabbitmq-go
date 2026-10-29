@@ -1,0 +1,74 @@
+
+name: OrderFlow CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nestjs-api:
+    name: NestJS API Tests and Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: apps/order-api
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/order-api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --runInBand
+
+      - name: Build API
+        run: npm run build
+
+  go-workers:
+    name: Go Worker Tests and Builds
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        worker:
+          - order-worker
+          - outbox-publisher
+          - notification-worker
+
+    defaults:
+      run:
+        working-directory: workers/${{ matrix.worker }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: workers/${{ matrix.worker }}/go.mod
+          cache: true
+          cache-dependency-path: workers/${{ matrix.worker }}/go.sum
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build worker
+        run: go build ./...
