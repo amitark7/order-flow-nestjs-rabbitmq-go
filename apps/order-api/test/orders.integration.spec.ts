@@ -1,6 +1,13 @@
 
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from '@jest/globals';
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  jest,
+} from '@jest/globals';
 import { integrationDataSource } from './integration-data-source.ts';
 import { OrdersService } from '../src/orders/orders.service.ts';
 import { Order } from '../src/orders/order.entity.ts';
@@ -95,19 +102,56 @@ describe('OrdersService PostgreSQL integration', () => {
     // });
 
     it('rolls back the order when the outbox insert fails', async () => {
-        const input = {
-            customerEmail: `rollback-${randomUUID()}@example.com`,
-            amount: 499,
-        };
+      const input = {
+        customerEmail: `rollback-${randomUUID()}@example.com`,
+        amount: 499,
+      };
 
+      const originalTransaction = integrationDataSource.transaction.bind(
+        integrationDataSource,
+      );
+
+      const transactionSpy = jest
+        .spyOn(integrationDataSource, 'transaction')
+        .mockImplementation(async (runInTransaction: any) => {
+          return originalTransaction(async (manager) => {
+            const originalSave = manager.save.bind(manager);
+
+            const failingManager = new Proxy(manager, {
+              get(target, property) {
+                if (property === 'save') {
+                  return async (targetOrEntity: any, entity?: any) => {
+                    if (targetOrEntity === OutboxEvent) {
+                      throw new Error('Simulated outbox insert failure');
+                    }
+
+                    return originalSave(targetOrEntity, entity);
+                  };
+                }
+
+                const value = Reflect.get(target, property, target);
+                return typeof value === 'function'
+                  ? value.bind(target)
+                  : value;
+              },
+            });
+
+            return runInTransaction(failingManager);
+          });
+        });
+
+      try {
         await expect(service.createOrder(input)).rejects.toThrow(
-            'Simulated outbox insert failure',
+          'Simulated outbox insert failure',
         );
+      } finally {
+        transactionSpy.mockRestore();
+      }
 
-        const persistedOrder = await integrationDataSource
-            .getRepository(Order)
-            .findOneBy({ customerEmail: input.customerEmail });
+      const persistedOrder = await integrationDataSource
+        .getRepository(Order)
+        .findOneBy({ customerEmail: input.customerEmail });
 
-        expect(persistedOrder).toBeNull();
+      expect(persistedOrder).toBeNull();
     });
 });
