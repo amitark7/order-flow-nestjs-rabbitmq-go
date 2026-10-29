@@ -94,3 +94,37 @@ jobs:
 
       - name: Build worker
         run: go build ./...
+        
+  docker-build:
+    name: Docker Image Build Validation
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: order-api
+            context: .
+            dockerfile: apps/order-api/Dockerfile
+          - name: order-worker
+            context: workers/order-worker
+            dockerfile: workers/order-worker/Dockerfile
+          - name: outbox-publisher
+            context: workers/outbox-publisher
+            dockerfile: workers/outbox-publisher/Dockerfile
+          - name: notification-worker
+            context: workers/notification-worker
+            dockerfile: workers/notification-worker/Dockerfile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: orderflow/${{ matrix.name }}:ci
+
