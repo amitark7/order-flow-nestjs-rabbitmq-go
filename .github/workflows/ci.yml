@@ -16,6 +16,58 @@ jobs:
     name: NestJS API Tests and Build
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: orderflow
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: orderflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderflow -d orderflow_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: apps/order-api
+
+    env:
+      TEST_DATABASE: orderflow_test
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: 5432
+      TEST_DB_USER: orderflow
+      TEST_DB_PASSWORD: test_password
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/order-api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --runInBand
+
+      - name: Build API
+        run: npm run build
+
+    name: NestJS API Tests and Build
+    runs-on: ubuntu-latest
+
+    env:
+      TEST_DATABASE: orderflow_test
+
     defaults:
       run:
         working-directory: apps/order-api
